@@ -1,0 +1,81 @@
+# Review workflow n8n `pre-beta-milano`
+
+## Problemi critici individuati
+
+1. **Campo email errato nel nodo `Edit Fields1`**
+   - `email_body` viene impostato con `=={{$json.email_body}}` (doppio `=` iniziale): rischia di produrre stringhe letterali/sporche.
+   - Dovrebbe essere `={{$json.email_body}}`.
+
+2. **Nodo Gmail legge il campo sbagliato**
+   - `Send a message` usa `message: {{$json.email_message...}}`.
+   - In quel punto del flusso, `email_message` non esiste ancora (viene creato solo dopo LLM nel nodo `Code in JavaScript3`).
+   - Prima dell’LLM il campo corretto è `email_body`.
+
+3. **Soggetto email incoerente**
+   - `Send a message` usa `($json.zone_tag || "Immobile")`, ma dopo `Edit Fields1`/`Code in JavaScript2` la zona è in `input_echo.zone_tag`.
+   - Risultato frequente: subject fallback su “Immobile”.
+
+4. **`to_email` non usato**
+   - In `Edit Fields1` crei `to_email = riccardosmith03@gmail.com`, ma il nodo Gmail invia a `user_email`.
+   - Se era un fallback/admin recipient, oggi non ha effetto.
+
+5. **`Code in JavaScript7` non marca esplicitamente lo stato bloccato**
+   - Riscrive `email_body` ma non imposta un flag (`is_blocked_report`) utile per routing, alert e analytics.
+
+6. **Parser comparabili fragile**
+   - Regex prezzi: `/€\s*([\d\.]+)/g` intercetta solo formato con `.` migliaia e senza decimali `,`.
+   - Regex mq: ok per `m²/mq/m2`, ma pairing prezzo/mq è solo posizionale: se il testo è disordinato, mediane sballate.
+
+7. **Doppio parsing benchmark ridondante**
+   - `Code in JavaScript5` parse della stringa benchmark.
+   - `Code in JavaScript6` rifà parsing se stringa.
+   - Funziona, ma è duplicazione da eliminare per semplicità.
+
+8. **Nodo finale non connesso**
+   - `Code in JavaScript` (Adapter OUT) è terminale e non alimenta risposta webhook né altri nodi.
+   - Se serve alla webapp, manca la connessione verso risposta/return payload.
+
+## Fix consigliati (minimi)
+
+### A) Correggere variabili email (alta priorità)
+
+- In `Edit Fields1`:
+  - `email_body` da `=={{$json.email_body}}` a `={{$json.email_body}}`.
+
+- Nel nodo `Send a message`:
+  - `message` da `{{$json.email_message...}}` a `{{$json.email_body...}}` **se invio diretto senza LLM**.
+  - Oppure, se vuoi invio del testo LLM, collega `Send a message` **dopo** `Code in JavaScript3` (come già avviene), ma in quel caso `subject` e `sendTo` devono usare i campi che quel nodo produce (`email_subject`, `user_email`, `email_message`).
+
+### B) Allineare il subject
+
+- Usare un subject unico già preparato:
+  - `={{$json.email_subject}}`
+
+### C) Esporre stato “bloccato”
+
+Nel nodo `Code in JavaScript7`, quando intercetti report bloccato:
+
+```js
+j.is_blocked_report = true;
+j.blocked_reason = "validation_or_zero_report";
+```
+
+Altrimenti:
+
+```js
+j.is_blocked_report = false;
+```
+
+### D) Rendere robusto parsing comparabili
+
+Accetta anche `€ 123,456.78`, `€123456`, e separatori misti:
+
+```js
+const priceRegex = /€\s*([\d\.,]+)/g;
+// normalizzazione esempio:
+const normalized = rawPrice.replace(/\./g, '').replace(',', '.');
+```
+
+## Nota architetturale
+
+La pipeline è strutturata bene (Adapter IN -> Merge dati benchmark/comparabili -> Runtime engine -> render email -> LLM rewrite -> invio), ma oggi è **sensibile a mismatch di campo** tra i blocchi. Una convenzione rigida dei nomi output/input per ogni nodo ridurrebbe quasi tutti i bug osservati.
